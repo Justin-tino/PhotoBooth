@@ -12,6 +12,12 @@ if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
+// ── In-memory session store ──────────────────────────────────────────────────
+// Railway uses ephemeral storage – files on disk are wiped on every redeploy.
+// We keep an in-memory map of sessionId → { filename → Buffer } so that
+// sessions survive disk wipes (they only disappear on process restart).
+const sessionStore = new Map();
+
 // Multer setup for file uploads
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -34,8 +40,28 @@ app.use((req, res, next) => {
   next();
 });
 
-// Upload endpoint: POST /api/upload/:sessionId
-// Expects multipart fields: color, bw, animation (each is a file)
+// ── Helper: get a file buffer (in-memory first, then disk) ───────────────────
+function getFileBuffer(sessionId, filename) {
+  // 1. Check in-memory store
+  const memSession = sessionStore.get(sessionId);
+  if (memSession && memSession[filename]) {
+    return memSession[filename];
+  }
+  // 2. Check disk
+  const diskPath = path.join(DATA_DIR, sessionId, filename);
+  if (fs.existsSync(diskPath)) {
+    return fs.readFileSync(diskPath);
+  }
+  return null;
+}
+
+// ── Helper: check if a session has any files ─────────────────────────────────
+function sessionHasFiles(sessionId) {
+  const files = ["color.png", "bw.png", "animation.gif"];
+  return files.some((f) => getFileBuffer(sessionId, f) !== null);
+}
+
+// ── Upload endpoint: POST /api/upload/:sessionId ─────────────────────────────
 app.post(
   "/api/upload/:sessionId",
   upload.fields([
@@ -46,37 +72,121 @@ app.post(
   (req, res) => {
     const { sessionId } = req.params;
     const files = req.files;
+
+    if (!files || Object.keys(files).length === 0) {
+      console.error(`Upload ${sessionId} failed: No files in request`);
+      return res.status(400).json({ success: false, error: "No files in request" });
+    }
+
     const uploaded = {};
-    for (const [key, fileArray] of Object.entries(files || {})) {
+    const memEntry = sessionStore.get(sessionId) || {};
+
+    for (const [key, fileArray] of Object.entries(files)) {
       if (fileArray && fileArray.length > 0) {
-        uploaded[key] = fileArray[0].originalname;
+        const f = fileArray[0];
+        uploaded[key] = f.originalname;
+
+        // Also store in memory so we survive Railway disk wipes
+        try {
+          const buf = fs.readFileSync(f.path);
+          memEntry[f.originalname] = buf;
+          console.log(`  Stored ${f.originalname} in memory (${buf.length} bytes)`);
+        } catch (e) {
+          console.error(`  Failed to read ${f.originalname} into memory: ${e.message}`);
+        }
       }
     }
-    console.log(`Uploaded session ${sessionId}:`, uploaded);
+
+    if (Object.keys(uploaded).length === 0) {
+      console.error(`Upload ${sessionId} failed: All file fields empty`);
+      return res.status(400).json({ success: false, error: "All file fields empty" });
+    }
+
+    sessionStore.set(sessionId, memEntry);
+    console.log(`Upload session ${sessionId}: ${JSON.stringify(uploaded)} (${sessionStore.size} active sessions)`);
     res.json({ success: true, sessionId, files: uploaded });
   }
 );
 
-// Serve files: GET /download/:sessionId/:filename
+// ── Status endpoint: GET /api/status/:sessionId ──────────────────────────────
+// The Flutter app calls this to verify files are present before showing the QR
+app.get("/api/status/:sessionId", (req, res) => {
+  const { sessionId } = req.params;
+  const hasColor = getFileBuffer(sessionId, "color.png") !== null;
+  const hasBW = getFileBuffer(sessionId, "bw.png") !== null;
+  const hasGif = getFileBuffer(sessionId, "animation.gif") !== null;
+  const ready = hasColor || hasBW || hasGif;
+
+  res.json({
+    sessionId,
+    ready,
+    files: { color: hasColor, bw: hasBW, animation: hasGif },
+  });
+});
+
+// ── Serve individual files: GET /download/:sessionId/:filename ───────────────
 app.get("/download/:sessionId/:filename", (req, res) => {
-  const filePath = path.join(DATA_DIR, req.params.sessionId, req.params.filename);
-  if (fs.existsSync(filePath)) {
-    res.sendFile(filePath);
+  const { sessionId, filename } = req.params;
+  const buf = getFileBuffer(sessionId, filename);
+
+  if (buf) {
+    const contentType = filename.endsWith(".gif") ? "image/gif" : "image/png";
+    res.set("Content-Type", contentType);
+    res.set("Content-Disposition", `attachment; filename="${filename}"`);
+    res.send(buf);
   } else {
     res.status(404).json({ error: "File not found" });
   }
 });
 
-// Download portal: GET /download/:sessionId
+// ── Download portal: GET /download/:sessionId ────────────────────────────────
 app.get("/download/:sessionId", (req, res) => {
   const { sessionId } = req.params;
-  const sessionDir = path.join(DATA_DIR, sessionId);
-  const hasColor = fs.existsSync(path.join(sessionDir, "color.png"));
-  const hasBW = fs.existsSync(path.join(sessionDir, "bw.png"));
-  const hasGif = fs.existsSync(path.join(sessionDir, "animation.gif"));
+  const hasColor = getFileBuffer(sessionId, "color.png") !== null;
+  const hasBW = getFileBuffer(sessionId, "bw.png") !== null;
+  const hasGif = getFileBuffer(sessionId, "animation.gif") !== null;
 
   if (!hasColor && !hasBW && !hasGif) {
-    return res.status(404).json({ error: "Session not found" });
+    return res.status(404).send(`
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Loveshots Photobooth</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #FFF0F1;
+            color: #333;
+            margin: 0;
+            padding: 20px;
+            text-align: center;
+        }
+        .container {
+            max-width: 500px;
+            margin: 40px auto;
+            background: white;
+            padding: 40px 20px;
+            border-radius: 24px;
+            box-shadow: 0 10px 25px rgba(244, 63, 94, 0.1);
+            border: 1px solid #FDD1D4;
+        }
+        h1 { color: #FF69B4; font-size: 28px; margin-bottom: 10px; font-weight: 900; }
+        p { color: #666; font-size: 16px; line-height: 1.6; }
+        .icon { font-size: 48px; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon">📸</div>
+        <h1>Session Not Ready</h1>
+        <p>Your photos are still being uploaded, or the session may have expired.</p>
+        <p style="font-size:13px; color:#999; margin-top:20px;">Try scanning the QR code again in a moment, or ask the booth operator for help.</p>
+    </div>
+</body>
+</html>
+    `);
   }
 
   const baseUrl = `${req.protocol}://${req.get("host")}`;
@@ -173,7 +283,7 @@ app.get("/download/:sessionId", (req, res) => {
 
 // Health check
 app.get("/", (req, res) => {
-  res.json({ status: "ok", name: "Loveshots Photobooth Server" });
+  res.json({ status: "ok", name: "Loveshots Photobooth Server", activeSessions: sessionStore.size });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
